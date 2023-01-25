@@ -7,17 +7,45 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
+#include <fcntl.h>
 
 const size_t k_max_msg = 4096;
 
+/**
+ * print error message without terminate
+*/
 static void msg(const char* msg) {
     fprintf(stderr, "%s\n", msg);
 }
 
+/**
+ * print error message and terminate
+*/
 static void die(const char* msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s", err, msg);
     abort();
+}
+
+/**
+ * set a fd to nonblocking mode by fcntl
+*/
+static void set_fd_nb(int fd) {
+    errno = 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (errno) {
+        die("fcntl err");
+        return;
+    }
+
+    flags |= O_NONBLOCK;
+    
+    errno = 0;
+    fcntl(fd, F_SETFD, flags);
+    if (errno) {
+        die("fcntl err");
+        return;
+    }
 }
 
 /**
@@ -54,6 +82,9 @@ static int32_t write_all(int fd, char* buf, size_t n) {
     return 0;
 }
 
+/**
+ * receive request and send reply
+*/
 static int32_t one_request(int connfd) {
     // 4 bytes header
     char rbuf[4 + k_max_msg + 1];
