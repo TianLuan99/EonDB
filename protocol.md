@@ -1,6 +1,9 @@
 # Protocol:
 
 ## Commands:
+### get [key]
+### set [key] [value]
+### del [key]
 ```
 +------+-----+------+-----+------+-----+-----+------+
 | nstr | len | str1 | len | str2 | ... | len | strn |
