@@ -10,7 +10,15 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
 #include <vector>
+// proj
+#include "hashtable.h"
+
+
+#define container_of(ptr, type, member) ({                  \
+    const decltype( ((type *)0)->member ) *__mptr = (ptr);    \
+    (type *)( (char *)__mptr - offsetof(type, member) );})
 
 
 static void msg(const char *msg) {
@@ -97,6 +105,161 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
+const size_t k_max_args = 1024;
+
+static int32_t parse_req(
+    const uint8_t *data, size_t len, std::vector<std::string> &out)
+{
+    if (len < 4) {
+        return -1;
+    }
+    uint32_t n = 0;
+    memcpy(&n, &data[0], 4);
+    if (n > k_max_args) {
+        return -1;
+    }
+
+    size_t pos = 4;
+    while (n--) {
+        if (pos + 4 > len) {
+            return -1;
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos], 4);
+        if (pos + 4 + sz > len) {
+            return -1;
+        }
+        out.push_back(std::string((char *)&data[pos + 4], sz));
+        pos += 4 + sz;
+    }
+
+    if (pos != len) {
+        return -1;  // trailing garbage
+    }
+    return 0;
+}
+
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2,
+};
+
+// The data structure for the key space.
+static struct {
+    HMap db;
+} g_data;
+
+// the structure for the key
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return lhs->hcode == rhs->hcode && le->key == re->key;
+}
+
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static uint32_t do_get(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return RES_NX;
+    }
+
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    memcpy(res, val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+    return RES_OK;
+}
+
+static uint32_t do_set(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+    return RES_OK;
+}
+
+static uint32_t do_del(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        delete container_of(node, Entry, node);
+    }
+    return RES_OK;
+}
+
+static bool cmd_is(const std::string &word, const char *cmd) {
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+static int32_t do_request(
+    const uint8_t *req, uint32_t reqlen,
+    uint32_t *rescode, uint8_t *res, uint32_t *reslen)
+{
+    std::vector<std::string> cmd;
+    if (0 != parse_req(req, reqlen, cmd)) {
+        msg("bad req");
+        return -1;
+    }
+    if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+        *rescode = do_get(cmd, res, reslen);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+        *rescode = do_set(cmd, res, reslen);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+        *rescode = do_del(cmd, res, reslen);
+    } else {
+        // cmd is not recognized
+        *rescode = RES_ERR;
+        const char *msg = "Unknown cmd";
+        strcpy((char *)res, msg);
+        *reslen = strlen(msg);
+        return 0;
+    }
+    return 0;
+}
+
 static bool try_one_request(Conn *conn) {
     // try to parse a request from the buffer
     if (conn->rbuf_size < 4) {
@@ -115,13 +278,21 @@ static bool try_one_request(Conn *conn) {
         return false;
     }
 
-    // got one request, do something with it
-    printf("client says: %.*s\n", len, &conn->rbuf[4]);
-
-    // generating echoing response
-    memcpy(&conn->wbuf[0], &len, 4);
-    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
-    conn->wbuf_size = 4 + len;
+    // got one request, generate the response.
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(
+        &conn->rbuf[4], len,
+        &rescode, &conn->wbuf[4 + 4], &wlen
+    );
+    if (err) {
+        conn->state = STATE_END;
+        return false;
+    }
+    wlen += 4;
+    memcpy(&conn->wbuf[0], &wlen, 4);
+    memcpy(&conn->wbuf[4], &rescode, 4);
+    conn->wbuf_size = 4 + wlen;
 
     // remove the request from the buffer.
     // note: frequent memmove is inefficient.
